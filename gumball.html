@@ -1,0 +1,267 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<title>ガムボールマシン</title>
+<style>
+  :root { --bg:#fff4d6; --ink:#3a2a1a; --card:#fffaf0; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#1f1a2e; --ink:#f3e9d2; --card:#2b2540; } }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font-family:system-ui,"Hiragino Sans","Noto Sans JP",sans-serif;
+         display:flex; flex-direction:column; align-items:center; padding:12px 16px 32px; min-height:100vh; }
+  h1 { font-size:1.3rem; margin:8px 0 4px; }
+  #wrap { width:100%; max-width:360px; touch-action:none; }
+  canvas { width:100%; height:auto; display:block; touch-action:none; user-select:none; -webkit-user-select:none; }
+  #msg { min-height:1.6em; text-align:center; font-weight:600; margin:6px 0; }
+  #stats { font-size:.85rem; opacity:.8; margin-bottom:8px; }
+  #collection { background:var(--card); border-radius:12px; padding:10px 12px; width:100%; max-width:360px;
+                display:grid; grid-template-columns:repeat(auto-fill,minmax(96px,1fr)); gap:6px; }
+  .item { display:flex; align-items:center; gap:6px; font-size:.8rem; }
+  .dot { width:16px; height:16px; border-radius:50%; flex:none; box-shadow:inset -2px -2px 3px rgba(0,0,0,.25); }
+  .item.none { opacity:.35; }
+  button { margin-top:10px; font:inherit; padding:6px 14px; border-radius:8px; border:1px solid currentColor; background:none; color:inherit; cursor:pointer; }
+</style>
+</head>
+<body>
+<h1>🍬 ガムボールマシン</h1>
+<div id="wrap"><canvas id="c" width="360" height="600" aria-label="ガムボールマシン"></canvas></div>
+<div id="msg">コインをタップして入れてね</div>
+<div id="stats"></div>
+<div id="collection"></div>
+<button id="reset">記録をリセット</button>
+
+<script>
+(() => {
+"use strict";
+const W = 360, H = 600, GX = 180, GY = 165, GR = 130, BR = 16;
+const cv = document.getElementById("c"), ctx = cv.getContext("2d");
+const msg = document.getElementById("msg");
+const dpr = Math.min(window.devicePixelRatio || 1, 3);
+cv.width = W * dpr; cv.height = H * dpr; ctx.scale(dpr, dpr);
+
+// ---- ガムの種類（weight は出やすさ） ----
+const KINDS = [
+  { name:"いちご",   color:"#ff4f7b", w:20 },
+  { name:"レモン",   color:"#ffe14d", w:20 },
+  { name:"メロン",   color:"#5fdc7a", w:18 },
+  { name:"ソーダ",   color:"#4dc3ff", w:18 },
+  { name:"ぶどう",   color:"#a26bff", w:14 },
+  { name:"オレンジ", color:"#ff9a3c", w:14 },
+  { name:"ゴールド", color:"#e8b923", w:3, rare:true },
+];
+const pick = () => { let t = KINDS.reduce((s,k)=>s+k.w,0)*Math.random(); for (const k of KINDS){ if((t-=k.w)<0) return k; } return KINDS[0]; };
+
+// ---- セーブデータ ----
+let save = { counts:{}, spent:0 };
+try { Object.assign(save, JSON.parse(localStorage.getItem("gumball-save")||"{}")); } catch(e){}
+const persist = () => { try { localStorage.setItem("gumball-save", JSON.stringify(save)); } catch(e){} };
+
+// ---- 音 ----
+let actx = null;
+function beep(freq, dur=0.08, type="square", vol=0.05) {
+  try {
+    actx = actx || new (window.AudioContext||window.webkitAudioContext)();
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = type; o.frequency.value = freq; g.gain.value = vol;
+    g.gain.exponentialRampToValueAtTime(0.0001, actx.currentTime + dur);
+    o.connect(g).connect(actx.destination); o.start(); o.stop(actx.currentTime + dur);
+  } catch(e){}
+}
+
+// ---- 状態 ----
+const balls = [];
+function addBall() {
+  const a = Math.random()*Math.PI, r = Math.random()*(GR-BR-4);
+  balls.push({ x:GX+Math.cos(a)*r*0.9, y:GY-Math.sin(a)*r, vx:0, vy:0, k:pick() });
+}
+for (let i=0;i<30;i++) addBall();
+
+let hasCoin = false, coinAnim = null;      // コイン投入アニメ
+let rot = 0, lastAng = null, dragging = false, rotVel = 0;
+let dropBall = null;                       // 落下中
+let trayBall = null;                       // 取り出し口
+let shake = 0;
+const KNOB = { x:GX, y:440, r:40 };
+const COIN = { x:60, y:560, r:20 };
+const OPEN = { x:130, y:498, w:100, h:62 };
+
+// ---- 物理 ----
+function physics() {
+  const stir = Math.min(Math.abs(rotVel)*6, 3);
+  for (const b of balls) {
+    b.vy += 0.3;
+    if (stir > 0.2) { b.vx += (Math.random()-0.5)*stir*1.6; b.vy -= Math.random()*stir*0.9; }
+    b.vx *= 0.995; b.vy *= 0.995;
+    b.x += b.vx; b.y += b.vy;
+    const dx = b.x-GX, dy = b.y-GY, d = Math.hypot(dx,dy), lim = GR-BR-2;
+    if (d > lim) {
+      const nx = dx/d, ny = dy/d;
+      b.x = GX+nx*lim; b.y = GY+ny*lim;
+      const vn = b.vx*nx + b.vy*ny;
+      if (vn > 0) { b.vx -= 1.5*vn*nx; b.vy -= 1.5*vn*ny; }
+    }
+  }
+  for (let it=0; it<2; it++)
+    for (let i=0;i<balls.length;i++) for (let j=i+1;j<balls.length;j++) {
+      const a=balls[i], b=balls[j], dx=b.x-a.x, dy=b.y-a.y, d2=dx*dx+dy*dy, m=BR*2;
+      if (d2 < m*m && d2 > 0.0001) {
+        const d=Math.sqrt(d2), nx=dx/d, ny=dy/d, o=(m-d)/2;
+        a.x-=nx*o; a.y-=ny*o; b.x+=nx*o; b.y+=ny*o;
+        const rv=(b.vx-a.vx)*nx+(b.vy-a.vy)*ny;
+        if (rv<0) { const p=rv*0.6; a.vx+=p*nx; a.vy+=p*ny; b.vx-=p*nx; b.vy-=p*ny; }
+      }
+    }
+  rotVel *= 0.9;
+}
+
+// ---- ガム排出 ----
+function dispense() {
+  hasCoin = false; rot = 0; dragging = false; lastAng = null;
+  if (dropBall || trayBall) return;
+  // 一番下にあるボールを取り出す
+  let bi = 0; balls.forEach((b,i)=>{ if (b.y > balls[bi].y) bi = i; });
+  const [b] = balls.splice(bi,1);
+  dropBall = { x:b.x, y:b.y, vx:(GX-b.x)*0.08, vy:0, k:b.k, phase:0 };
+  beep(220,0.15,"sawtooth",0.05);
+  setTimeout(addBall, 600);
+}
+function updateDrop() {
+  const d = dropBall; if (!d) return;
+  d.vy += 0.5; d.x += d.vx; d.y += d.vy;
+  if (d.phase === 0) { d.vx += (GX-d.x)*0.05; if (d.y > 330) { d.phase = 1; d.x = GX; d.vx = 0; } }
+  const floor = OPEN.y + OPEN.h - BR - 2;
+  if (d.phase === 1 && d.y >= floor) {
+    d.y = floor;
+    if (d.vy > 3) { d.vy *= -0.35; beep(520,0.05,"triangle",0.06); }
+    else { trayBall = { x:GX, y:floor, k:d.k }; dropBall = null;
+           msg.textContent = "ガムが出てきた！ タップして取ろう"; beep(880,0.12,"triangle",0.07); }
+  }
+}
+
+// ---- 描画 ----
+function circle(x,y,r,fill){ ctx.beginPath(); ctx.arc(x,y,r,0,Math.PI*2); ctx.fillStyle=fill; ctx.fill(); }
+function drawBall(x,y,k){
+  circle(x,y,BR,k.color);
+  const g = ctx.createRadialGradient(x-5,y-6,1,x,y,BR);
+  g.addColorStop(0,"rgba(255,255,255,.75)"); g.addColorStop(.35,"rgba(255,255,255,0)"); g.addColorStop(1,"rgba(0,0,0,.28)");
+  circle(x,y,BR,g);
+  if (k.rare) { ctx.strokeStyle="#fff7"; ctx.lineWidth=2; ctx.beginPath(); ctx.arc(x,y,BR+1,0,6.3); ctx.stroke(); }
+}
+function rr(x,y,w,h,r){ ctx.beginPath(); ctx.roundRect(x,y,w,h,r); }
+
+function draw() {
+  ctx.clearRect(0,0,W,H);
+  // 台座
+  rr(50,300,260,285,18); ctx.fillStyle="#d9302c"; ctx.fill();
+  // ガラスの球
+  ctx.save(); ctx.beginPath(); ctx.arc(GX,GY,GR,0,Math.PI*2); ctx.clip();
+  circle(GX,GY,GR,"rgba(190,230,255,.28)");
+  for (const b of balls) drawBall(b.x,b.y,b.k);
+  if (dropBall && dropBall.phase===0) drawBall(dropBall.x,dropBall.y,dropBall.k);
+  ctx.restore();
+  ctx.lineWidth=5; ctx.strokeStyle="rgba(255,255,255,.55)"; ctx.beginPath(); ctx.arc(GX,GY,GR,0,Math.PI*2); ctx.stroke();
+  ctx.strokeStyle="rgba(255,255,255,.7)"; ctx.lineWidth=7; ctx.lineCap="round";
+  ctx.beginPath(); ctx.arc(GX,GY,GR-14,Math.PI*1.12,Math.PI*1.38); ctx.stroke();
+  // 台座とキャップ
+  rr(60,296,240,28,10); ctx.fillStyle="#a81f1c"; ctx.fill();
+  rr(70,324,220,250,16); ctx.fillStyle="#e8403a"; ctx.fill();
+  rr(70,324,220,250,16); ctx.strokeStyle="#9a1c19"; ctx.lineWidth=3; ctx.stroke();
+  // コイン投入口
+  rr(GX-34,340,68,34,8); ctx.fillStyle="#2b2b2b"; ctx.fill();
+  rr(GX-18,352,36,6,3); ctx.fillStyle="#000"; ctx.fill();
+  ctx.fillStyle="#fff"; ctx.font="bold 12px system-ui"; ctx.textAlign="center"; ctx.fillText("100円",GX,388);
+  // 投入中のコイン
+  if (coinAnim) {
+    const t = coinAnim.t;
+    const cx = COIN.x + (GX-COIN.x)*Math.min(t*1.6,1), cy = COIN.y + (356-COIN.y)*Math.min(t*1.6,1);
+    if (t < 0.65) { ctx.save(); ctx.translate(cx,cy); ctx.scale(1, 1-0.0*t); circle(0,0,COIN.r,"#e8b923"); ctx.restore(); }
+  }
+  // ノブ
+  const sx = shake ? Math.sin(shake*2)*3 : 0;
+  ctx.save(); ctx.translate(KNOB.x+sx,KNOB.y);
+  circle(0,0,KNOB.r+6,"#8a1714");
+  circle(0,0,KNOB.r,hasCoin?"#ffd23f":"#c9c2b0");
+  ctx.rotate(rot);
+  rr(-KNOB.r+6,-9,(KNOB.r-6)*2,18,9); ctx.fillStyle=hasCoin?"#e0a800":"#9d9784"; ctx.fill();
+  circle(0,0,9,"#6b5a1c");
+  ctx.restore();
+  // 取り出し口
+  rr(OPEN.x,OPEN.y,OPEN.w,OPEN.h,14); ctx.fillStyle="#1a0f0f"; ctx.fill();
+  ctx.save(); rr(OPEN.x,OPEN.y,OPEN.w,OPEN.h,14); ctx.clip();
+  if (dropBall && dropBall.phase===1) drawBall(dropBall.x,dropBall.y,dropBall.k);
+  if (trayBall) {
+    drawBall(trayBall.x,trayBall.y + Math.sin(performance.now()/250)*2,trayBall.k);
+  }
+  ctx.restore();
+  rr(OPEN.x,OPEN.y-6,OPEN.w,10,5); ctx.fillStyle="#b82622"; ctx.fill(); // フラップ
+  // コイン置き場
+  if (!hasCoin && !coinAnim) {
+    circle(COIN.x,COIN.y,COIN.r+4,"rgba(0,0,0,.15)");
+    circle(COIN.x,COIN.y,COIN.r,"#e8b923");
+    circle(COIN.x,COIN.y,COIN.r-6,"#f6d15a");
+    ctx.fillStyle="#7a5a00"; ctx.font="bold 13px system-ui"; ctx.textAlign="center"; ctx.fillText("¥",COIN.x,COIN.y+5);
+  }
+  // 回転ヒント
+  if (hasCoin) { ctx.fillStyle="#fff"; ctx.font="bold 11px system-ui"; ctx.textAlign="center"; ctx.fillText("↻ ぐるっと回す",GX,KNOB.y+KNOB.r+22); }
+}
+
+// ---- 入力 ----
+function pos(e){ const r=cv.getBoundingClientRect(); return { x:(e.clientX-r.left)*W/r.width, y:(e.clientY-r.top)*H/r.height }; }
+const near=(p,o,r)=>Math.hypot(p.x-o.x,p.y-o.y) <= r;
+
+cv.addEventListener("pointerdown", e => {
+  const p = pos(e);
+  if (trayBall && p.x>OPEN.x && p.x<OPEN.x+OPEN.w && p.y>OPEN.y-10 && p.y<OPEN.y+OPEN.h+10) {
+    const k = trayBall.k; trayBall = null;
+    save.counts[k.name] = (save.counts[k.name]||0)+1; persist(); render();
+    msg.textContent = k.rare ? `✨ レア！ ${k.name}ガムをゲット！` : `${k.name}ガムをゲット！`;
+    beep(660,0.1,"triangle",0.07); setTimeout(()=>beep(990,0.15,"triangle",0.07),90);
+    return;
+  }
+  if (!hasCoin && !coinAnim && near(p,COIN,COIN.r+14)) {
+    if (dropBall || trayBall) { msg.textContent = "先にガムを取り出してね"; return; }
+    coinAnim = { t:0 }; save.spent += 100; persist(); render(); beep(1200,0.06,"square",0.04);
+    return;
+  }
+  if (near(p,KNOB,KNOB.r+14)) {
+    if (!hasCoin) { shake = 12; msg.textContent = "コインを入れてね"; beep(120,0.1,"square",0.05); return; }
+    dragging = true; lastAng = Math.atan2(p.y-KNOB.y, p.x-KNOB.x);
+    cv.setPointerCapture(e.pointerId);
+  }
+});
+cv.addEventListener("pointermove", e => {
+  if (!dragging) return;
+  const p = pos(e), a = Math.atan2(p.y-KNOB.y, p.x-KNOB.x);
+  let d = a - lastAng; if (d > Math.PI) d -= 2*Math.PI; if (d < -Math.PI) d += 2*Math.PI;
+  lastAng = a;
+  if (d > 0) { rot += d; rotVel = d; if (Math.floor(rot*3)%2===0) beep(300+rot*20,0.02,"square",0.015); }
+  if (rot >= Math.PI*2) dispense();
+});
+const endDrag = () => { if (dragging) { dragging = false; if (hasCoin) rot = 0; } };
+cv.addEventListener("pointerup", endDrag); cv.addEventListener("pointercancel", endDrag);
+
+// ---- 表示 ----
+function render() {
+  document.getElementById("stats").textContent = `使った金額：${save.spent}円　ゲット：${Object.values(save.counts).reduce((a,b)=>a+b,0)}個`;
+  document.getElementById("collection").innerHTML = KINDS.map(k => {
+    const n = save.counts[k.name]||0;
+    return `<div class="item ${n?"":"none"}"><span class="dot" style="background:${k.color}"></span>${k.name} ×${n}</div>`;
+  }).join("");
+}
+document.getElementById("reset").onclick = () => {
+  if (confirm("記録をリセットしますか？")) { save = { counts:{}, spent:0 }; persist(); render(); }
+};
+
+// ---- ループ ----
+function loop() {
+  if (coinAnim) { coinAnim.t += 0.03; if (coinAnim.t >= 1) { coinAnim = null; hasCoin = true; rot = 0; msg.textContent = "ハンドルを回してね"; beep(700,0.08,"triangle",0.06); } }
+  if (shake > 0) shake--;
+  physics(); updateDrop(); draw();
+  requestAnimationFrame(loop);
+}
+render(); loop();
+})();
+</script>
+</body>
+</html>
